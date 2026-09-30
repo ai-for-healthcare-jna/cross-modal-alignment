@@ -275,7 +275,7 @@ def load_hest_subset(
         patch_file = patch_dir / f"{sample_id}.h5"
         if not patch_file.exists():
             # HEST cuts patches from the whole-slide image on demand. 224 px at
-            # 0.5 um/px is the resolution UNI was trained at.
+            # 0.5 um/px (20x) is the magnification Phikon-v2 was trained at.
             st.dump_patches(str(patch_dir), name=sample_id, target_patch_size=224,
                             target_pixel_size=0.5)
 

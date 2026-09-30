@@ -44,9 +44,14 @@ any relationship between morphology and expression. The silhouette scores in
 Both encoders are frozen; the only trainable parameters are two small MLP projection
 heads into a shared 128-d space, trained with InfoNCE.
 
-- **Image side:** [UNI](https://huggingface.co/MahmoodLab/UNI) (ViT-L/16, 1024-d),
-  frozen. Same lab as HEST-1k and trained at the 0.5 µm/px resolution HEST patches
-  are cut at.
+- **Image side:** [Phikon-v2](https://huggingface.co/owkin/phikon-v2) (ViT-L/16,
+  DINOv2, 1024-d CLS token), frozen. Chosen over UNI and H-optimus because those
+  are gated behind institutional-email verification — Phikon-v2 is openly
+  downloadable, so these results are actually reproducible. It is trained on ~450M
+  20x histology tiles from public cohorts (TCGA, CPTAC, GTEx), which matches the
+  magnification HEST patches are cut at, and it appears in the HEST-Benchmark
+  comparison table, so its behaviour on this dataset family is already documented.
+  Licence is non-commercial, which is fine for research use.
 - **Expression side:** the 50 highest-variance genes, library-size normalised to
   10,000 counts per spot and log1p transformed. No learned expression encoder in v1 —
   the normalised vector goes straight into its projection head.

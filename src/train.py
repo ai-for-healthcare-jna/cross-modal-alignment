@@ -44,7 +44,7 @@ class TrainConfig:
 def standardize(features: np.ndarray, train_idx: np.ndarray) -> np.ndarray:
     """Zero-mean unit-variance per dimension, using training statistics only.
 
-    UNI's output dimensions have very different scales and offsets. Feeding
+    Phikon-v2's output dimensions have very different scales and offsets. Feeding
     them raw makes the first linear layer spend its capacity undoing that.
     Statistics come from train because computing them over the held-out cohort
     would let the model see the test distribution's mean — a small leak, but the

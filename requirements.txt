@@ -8,8 +8,9 @@ pandas==3.0.6
 scikit-learn==1.9.1
 scipy==1.17.1
 
-# Image encoder. UNI is distributed through the timm hub, not transformers.
-timm==1.0.30
+# Image encoder. Phikon-v2 is a standard transformers checkpoint
+# (AutoImageProcessor + AutoModel), so no timm dependency is needed.
+transformers==5.18.0
 huggingface-hub==2.0.0
 pillow==12.3.0
 

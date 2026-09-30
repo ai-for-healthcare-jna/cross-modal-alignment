@@ -1,6 +1,6 @@
 """The only trainable part of the system: two small projection heads.
 
-Both encoders are frozen — the image side is UNI, the expression side is just a
+Both encoders are frozen — the image side is Phikon-v2, the expression side is just a
 normalised gene vector. All this model does is learn two maps into a shared
 128-d space where matched image/expression pairs sit close together.
 

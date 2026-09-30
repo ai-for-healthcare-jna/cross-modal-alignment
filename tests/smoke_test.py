@@ -33,7 +33,7 @@ from splits import STRATEGIES, build_all_splits, leave_one_group_out  # noqa: E4
 from train import TrainConfig, run_strategy  # noqa: E402
 
 SEED = 0
-IMAGE_DIM = 1024  # UNI's output width, so the head sizes match the real run
+IMAGE_DIM = 1024  # Phikon-v2's CLS width, so head sizes match the real run
 
 
 def check_data(verbose=True):

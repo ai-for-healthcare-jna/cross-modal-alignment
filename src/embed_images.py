@@ -18,30 +18,46 @@ cache directory instead of silently reusing vectors from a different model.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
 
-# Encoder registry. UNI is the default: it comes from the same lab as HEST-1k,
-# is trained at the 0.5 um/px resolution HEST patches are cut at, and is
-# publicly downloadable, which matters for reproducibility. Adding an entry here
-# is all that is needed to compare against another encoder.
+# Encoder registry. Adding an entry here is all that is needed to compare
+# against another encoder, which is worth having: "the result held with a second
+# encoder" is a cheap and meaningful robustness check once the cache exists.
+#
+# Phikon-v2 is the default, chosen for three reasons:
+#
+#   Open access. It needs no gating request and no institutional email, so
+#   anyone reading this repo can reproduce the numbers. The stronger
+#   alternatives in this space (UNI, H-optimus) are both gated behind
+#   institutional verification, which makes them unusable here and would make
+#   the results unreproducible for most readers.
+#
+#   Magnification match. Trained on 20x histology tiles, which is the
+#   magnification HEST patches are cut at (224 px at 0.5 um/px). An encoder
+#   trained at a different magnification would see our patches out of
+#   distribution, and any failure to align would be confounded with that.
+#
+#   Known quantity. Phikon-v2 appears in the HEST-Benchmark comparison table,
+#   so its behaviour on this exact dataset family is already documented. That
+#   gives a reference point for whether our frozen features are reasonable
+#   before we start interpreting alignment results.
+#
+# It is a ViT-L/16 (DINOv2 architecture) pretrained on ~450M tiles from public
+# cohorts including TCGA, CPTAC and GTEx. Non-commercial licence, which is fine
+# for research use.
 ENCODERS = {
-    "uni": {
-        "hf_hub": "hf-hub:MahmoodLab/UNI",
-        "embed_dim": 1024,
-        "timm_kwargs": {"init_values": 1e-5, "dynamic_img_size": True},
-    },
-    "uni2": {
-        "hf_hub": "hf-hub:MahmoodLab/UNI2-h",
-        "embed_dim": 1536,
-        "timm_kwargs": {"init_values": 1e-5, "dynamic_img_size": True},
-    },
+    "phikon-v2": {"hf_id": "owkin/phikon-v2", "embed_dim": 1024},
+    # ViT-B predecessor. Half the width, so it doubles as a quick check that
+    # results are not an artefact of one particular feature dimensionality.
+    "phikon": {"hf_id": "owkin/phikon", "embed_dim": 768},
 }
 
-DEFAULT_ENCODER = "uni"
+DEFAULT_ENCODER = "phikon-v2"
 
 
 def pick_device(requested: str = "auto") -> str:
@@ -105,52 +121,78 @@ def load_cached_embeddings(
 
 
 def load_encoder(encoder: str, device: str):
-    """Load the frozen encoder and its matching preprocessing transform.
+    """Load the frozen encoder and its matching image processor.
+
+    The processor is loaded from the same checkpoint rather than hand-rolled:
+    it carries the resize and per-channel normalisation the model was trained
+    with, and getting those wrong silently degrades features rather than
+    raising.
 
     eval() and requires_grad_(False) are both set here rather than left to the
     caller. The encoder being frozen is an assumption baked into the whole
     design of this repo, so it is enforced at the point of construction.
     """
-    import timm
-    from timm.data import resolve_data_config
-    from timm.data.transforms_factory import create_transform
+    from transformers import AutoImageProcessor, AutoModel
 
     if encoder not in ENCODERS:
         raise ValueError(f"unknown encoder '{encoder}', expected one of {list(ENCODERS)}")
-    spec = ENCODERS[encoder]
+    hf_id = ENCODERS[encoder]["hf_id"]
 
-    model = timm.create_model(spec["hf_hub"], pretrained=True, **spec["timm_kwargs"])
+    processor = AutoImageProcessor.from_pretrained(hf_id)
+    model = AutoModel.from_pretrained(hf_id)
     model.eval().requires_grad_(False).to(device)
-    transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
-    return model, transform
+
+    expected = ENCODERS[encoder]["embed_dim"]
+    if model.config.hidden_size != expected:
+        raise ValueError(
+            f"{hf_id} reports hidden_size={model.config.hidden_size}, "
+            f"registry says {expected} — update ENCODERS"
+        )
+    return model, processor
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def embed_patch_file(
-    patch_file: Path, model, transform, device: str, batch_size: int = 64
+    patch_file: Path, model, processor, device: str, batch_size: int = 64
 ) -> tuple[list[str], np.ndarray]:
     """Embed every patch in one HEST patch .h5.
 
     HEST writes patches as an 'img' dataset of uint8 (N, 224, 224, 3) with a
     matching 'barcode' dataset. We read in chunks rather than loading the whole
     file: a large Visium sample is several GB uncompressed.
+
+    We take the CLS token rather than mean-pooling the patch tokens. For a
+    DINOv2-style model the CLS token is the representation the pretraining
+    objective actually shaped, and it is what Phikon-v2's own model card uses —
+    so it is the comparable choice. Mean pooling is a defensible alternative and
+    sometimes helps on dense tasks, but mixing conventions would make our
+    numbers incomparable to published ones for no benefit.
     """
     import h5py
     from PIL import Image
 
     features, barcodes = [], []
-    autocast = torch.autocast(device_type=device, dtype=torch.float16) if device == "cuda" \
-        else torch.autocast(device_type="cpu", enabled=False)
+    # fp16 on CUDA only. MPS autocast is unreliable and CPU fp16 is slower than
+    # fp32, so neither is worth the risk on a step we run once.
+    amp = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if device == "cuda"
+        else contextlib.nullcontext()
+    )
 
     with h5py.File(patch_file, "r") as f:
         images, codes = f["img"], f["barcode"]
-        n = len(images)
-        for start in range(0, n, batch_size):
+        for start in range(0, len(images), batch_size):
             chunk = images[start : start + batch_size]
-            batch = torch.stack([transform(Image.fromarray(img)) for img in chunk]).to(device)
-            with autocast:
-                out = model(batch)
-            features.append(out.float().cpu().numpy())
+            inputs = processor(
+                images=[Image.fromarray(img) for img in chunk], return_tensors="pt"
+            ).to(device)
+
+            with amp:
+                outputs = model(**inputs)
+
+            cls = outputs.last_hidden_state[:, 0, :]
+            features.append(cls.float().cpu().numpy())
             barcodes.extend(str(c) for c in np.asarray(codes[start : start + batch_size]).ravel())
 
     return barcodes, np.concatenate(features)
@@ -170,7 +212,7 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"encoder={args.encoder} device={device}")
 
-    model, transform = load_encoder(args.encoder, device)
+    model, processor = load_encoder(args.encoder, device)
 
     patch_dir = Path(args.data_dir) / "patches"
     for sample_id in args.samples:
@@ -184,7 +226,7 @@ def main() -> None:
             raise FileNotFoundError(f"{patch_file} not found; run data_loading first")
 
         barcodes, features = embed_patch_file(
-            patch_file, model, transform, device, batch_size=args.batch_size
+            patch_file, model, processor, device, batch_size=args.batch_size
         )
         # Prefix with the sample id so spot ids are globally unique once cohorts
         # are pooled — barcodes are only unique within a sample.
