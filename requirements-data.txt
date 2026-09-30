@@ -1,0 +1,17 @@
+# Only needed to download and read raw HEST-1k data (src/data_loading.py).
+#
+# Kept separate from requirements.txt on purpose. `hest` pulls in a large stack
+# (scanpy, anndata, openslide bindings) that is irrelevant once embeddings are
+# cached, and its install is the most fragile part of the setup. Splitting it
+# out means the smoke test, training and evaluation all run without it, so a
+# broken hest install can't block iteration on the actual research question.
+#
+# Install with:  pip install -r requirements.txt -r requirements-data.txt
+#
+# Left unpinned: not yet installed or verified on this machine. Pin these once
+# the first real data pull succeeds.
+
+hest
+scanpy
+anndata
+datasets

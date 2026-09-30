@@ -1,0 +1,21 @@
+# Core stack: everything except loading raw HEST data.
+# Versions pinned to what the smoke test was verified against (Python 3.11, macOS arm64).
+# The HEST loader has its own file — see requirements-data.txt for why.
+
+torch==2.14.0
+numpy==2.2.6
+pandas==3.0.6
+scikit-learn==1.9.1
+scipy==1.17.1
+
+# Image encoder. UNI is distributed through the timm hub, not transformers.
+timm==1.0.30
+huggingface-hub==2.0.0
+pillow==12.3.0
+
+# Reading HEST patch .h5 files in embed_images.py
+h5py==3.16.0
+
+tqdm==4.70.1
+matplotlib==3.11.2
+pytest==9.1.1

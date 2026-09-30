@@ -1,0 +1,21 @@
+# Data and artefacts — all reproducible from the scripts, none of it belongs in git.
+data/
+embeddings/
+results/*
+!results/.gitkeep
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
