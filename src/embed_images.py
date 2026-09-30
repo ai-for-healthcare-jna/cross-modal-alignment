@@ -151,6 +151,22 @@ def load_encoder(encoder: str, device: str):
     return model, processor
 
 
+def _decode_barcode(raw) -> str:
+    """h5py gives back bytes, not str.
+
+    Worth a named helper because the naive `str(raw)` yields "b'AAACCT'" — the
+    repr, complete with the b and the quotes. That still looks like a plausible
+    id, so it survives every shape check and only fails much later when these
+    keys are matched against the plain-string barcodes in HEST's AnnData. The
+    symptom would be a total cache miss on the real run, after the GPU bill.
+    """
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    if isinstance(raw, np.bytes_):
+        return raw.tobytes().decode("utf-8")
+    return str(raw)
+
+
 @torch.inference_mode()
 def embed_patch_file(
     patch_file: Path, model, processor, device: str, batch_size: int = 64
@@ -193,7 +209,9 @@ def embed_patch_file(
 
             cls = outputs.last_hidden_state[:, 0, :]
             features.append(cls.float().cpu().numpy())
-            barcodes.extend(str(c) for c in np.asarray(codes[start : start + batch_size]).ravel())
+            barcodes.extend(
+                _decode_barcode(c) for c in np.asarray(codes[start : start + batch_size]).ravel()
+            )
 
     return barcodes, np.concatenate(features)
 
