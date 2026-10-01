@@ -4,10 +4,9 @@ Runs on CPU in seconds once embed_images.py has populated the cache — the only
 tensors involved are a few thousand rows of a couple of thousand floats. That
 cheapness is the whole reason the caching step exists.
 
-One model is trained per split fold. Everything that is fit from data — the
-gene panel, the image feature standardisation — is fit on that fold's training
-spots only and applied to val/test, so the leave-one-out numbers mean what they
-claim to mean.
+One model per split. Everything fit from data — the gene panel, the image
+feature standardisation — comes from that split's training spots only, so the
+cross-organ number means what it claims to.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from data_loading import SpotData, build_expression_features, make_dummy_dataset
 from embed_images import DEFAULT_ENCODER, load_cached_embeddings
 from evaluate import evaluate_split, retrieval_metrics
 from model import AlignmentModel, info_nce_loss
-from splits import STRATEGIES, Split, build_splits
+from splits import STRATEGIES, Split, build_split
 
 
 @dataclass
@@ -157,45 +156,39 @@ def run_strategy(
     strategy: str,
     cfg: TrainConfig,
     verbose: bool = True,
-) -> list[dict]:
-    """Train and evaluate every fold of one split strategy."""
-    results = []
-    for split in build_splits(data.metadata, strategy, seed=cfg.seed):
-        # Refit per fold: both of these are data-dependent and must not see test.
-        expr_features, genes = build_expression_features(data, split.train, n_genes=cfg.n_genes)
-        image_features = standardize(image_features_raw, split.train)
+) -> dict:
+    """Train and evaluate one split strategy."""
+    split = build_split(data.metadata, strategy, seed=cfg.seed)
 
-        if verbose:
-            print(f"    fold '{split.name}' {split.sizes()}")
-        model, history = train_one_split(image_features, expr_features, split, cfg, verbose)
+    # Both are fit from data, so both are refit per split and never see test.
+    expr_features, genes = build_expression_features(data, split.train, n_genes=cfg.n_genes)
+    image_features = standardize(image_features_raw, split.train)
 
-        metrics = evaluate_split(
-            model, image_features, expr_features, data.metadata, split.test,
-            device=cfg.device,
-        )
-        results.append({
-            "strategy": strategy,
-            "fold": split.name,
-            "held_out": split.held_out,
-            "in_distribution_val": split.in_distribution_val,
-            **split.sizes(),
-            "epochs_run": len(history),
-            "n_genes": len(genes),
-            **metrics,
-        })
-        if verbose:
-            print(f"      test i2e R@1 {metrics['i2e_recall@1']:.3f} "
-                  f"(chance {metrics['i2e_chance_recall@1']:.3f}) | "
-                  f"silhouette organ {metrics['silhouette_organ']:.3f} "
-                  f"cohort {metrics['silhouette_cohort']:.3f}")
-    return results
+    model, history = train_one_split(image_features, expr_features, split, cfg, verbose)
+    metrics = evaluate_split(
+        model, image_features, expr_features, data.metadata, split.test, device=cfg.device
+    )
+
+    if verbose:
+        print(f"    {split.name} {split.sizes()}")
+        print(f"      i2e R@1 {metrics['i2e_recall@1']:.3f} "
+              f"(chance {metrics['i2e_chance_recall@1']:.4f}) "
+              f"R@5 {metrics['i2e_recall@5']:.3f} MRR {metrics['i2e_mrr']:.3f}")
+    return {
+        "strategy": strategy,
+        "split": split.name,
+        **split.sizes(),
+        "epochs_run": len(history),
+        "n_genes": len(genes),
+        **metrics,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train cross-modal alignment heads.")
     parser.add_argument("--strategies", nargs="+", default=list(STRATEGIES), choices=list(STRATEGIES))
     parser.add_argument("--samples", nargs="+", help="HEST sample ids (omit to use dummy data)")
-    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--data-dir", default="data/hest")
     parser.add_argument("--encoder", default=DEFAULT_ENCODER)
     parser.add_argument("--embeddings", default="embeddings")
     parser.add_argument("--out", default="results/metrics.json")
@@ -210,9 +203,9 @@ def main() -> None:
                       seed=args.seed, device=args.device)
 
     if args.samples:
-        from data_loading import load_hest_subset
+        from data_loading import load_cohorts
 
-        data = load_hest_subset(args.samples, args.data_dir)
+        data = load_cohorts(args.samples, args.data_dir)
         image_features = load_cached_embeddings(
             data.metadata["spot_id"].tolist(), encoder=args.encoder, root=args.embeddings
         )
@@ -224,10 +217,8 @@ def main() -> None:
 
     print(data.summary().to_string(index=False))
 
-    results = []
-    for strategy in args.strategies:
-        print(f"\n  strategy: {strategy}")
-        results.extend(run_strategy(data, image_features, strategy, cfg))
+    results = [run_strategy(data, image_features, strategy, cfg)
+               for strategy in args.strategies]
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

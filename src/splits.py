@@ -1,20 +1,13 @@
-"""Train/val/test index generation under four increasingly hostile protocols.
+"""Train/val/test indices for the two evaluations.
 
-The four strategies are the experiment, not a utility. Each one holds out a
-different kind of structure:
+within_cohort  breast spots split 80/20. Neighbouring spots from the same
+               slide land on both sides, so the model can do well by
+               memorising the slide. Optimistic baseline, not a result.
+cross_organ    train on breast, test on prostate. Same platform, same assay,
+               different tissue.
 
-  random      spots shuffled freely. Neighbouring spots from the same slide end
-              up on both sides, so the model can win by memorising the slide.
-              This is the optimistic baseline, not a result.
-  cohort      a whole study is held out. Tests transfer across lab, protocol
-              and patient population at once.
-  organ       a whole tissue type is held out. Tests whether the alignment
-              encodes anything about tissue biology in general.
-  platform    a whole sequencing technology is held out. The most purely
-              technical of the three, and the cleanest test of batch fitting.
-
-The gap between `random` and the rest is the headline number. If random scores
-well and leave-one-cohort-out collapses, the model was fitting batch structure.
+The gap between them is the finding. Chance level is reported alongside both
+in evaluate.py, since Recall@1 only means something relative to gallery size.
 """
 
 from __future__ import annotations
@@ -22,137 +15,53 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
 
-STRATEGIES = ("random", "cohort", "organ", "platform")
-
-# Which metadata column defines the held-out group for each leave-one-out strategy.
-_GROUP_COLUMN = {"cohort": "cohort_id", "organ": "organ", "platform": "platform"}
+STRATEGIES = ("within_cohort", "cross_organ")
 
 
 @dataclass
 class Split:
-    """One train/val/test partition, as positional indices into SpotData."""
-
     name: str
-    strategy: str
     train: np.ndarray
     val: np.ndarray
     test: np.ndarray
-    held_out: str | None = None  # which group is in test, for leave-one-out
-    # True when val had to be drawn from the training distribution rather than
-    # a held-out group. Tracked so it can be reported alongside the metrics.
-    in_distribution_val: bool = False
 
-    def __post_init__(self) -> None:
-        for part in ("train", "val", "test"):
-            if len(getattr(self, part)) == 0:
-                raise ValueError(f"split '{self.name}' has an empty {part} set")
-        train, val, test = set(self.train), set(self.val), set(self.test)
-        if (train & val) or (train & test) or (val & test):
-            raise ValueError(f"split '{self.name}' has overlapping partitions")
-
-    def sizes(self) -> dict[str, int]:
+    def sizes(self):
         return {"train": len(self.train), "val": len(self.val), "test": len(self.test)}
 
 
-def random_split(
-    metadata: pd.DataFrame,
-    val_frac: float = 0.15,
-    test_frac: float = 0.15,
-    seed: int = 0,
-) -> list[Split]:
-    """Shuffle spots and cut. The optimistic baseline.
+def within_cohort(metadata, organ="Breast", val_frac=0.1, test_frac=0.2, seed=0):
+    idx = np.where(metadata.organ == organ)[0]
+    idx = np.random.default_rng(seed).permutation(idx)
 
-    No grouping at all — this is intentionally leaky with respect to slide and
-    cohort, because its job is to show how good the numbers look when you don't
-    control for batch.
-    """
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(metadata))
-    n_test = max(1, int(round(len(idx) * test_frac)))
-    n_val = max(1, int(round(len(idx) * val_frac)))
-    return [
-        Split(
-            name="random",
-            strategy="random",
-            test=np.sort(idx[:n_test]),
-            val=np.sort(idx[n_test : n_test + n_val]),
-            train=np.sort(idx[n_test + n_val :]),
-        )
-    ]
+    n_test = int(len(idx) * test_frac)
+    n_val = int(len(idx) * val_frac)
+    return Split(
+        name=f"within_cohort:{organ}",
+        test=np.sort(idx[:n_test]),
+        val=np.sort(idx[n_test : n_test + n_val]),
+        train=np.sort(idx[n_test + n_val :]),
+    )
 
 
-def leave_one_group_out(
-    metadata: pd.DataFrame, strategy: str, val_frac: float = 0.15, seed: int = 0
-) -> list[Split]:
-    """One Split per group: that group is test, and the rest is train/val.
-
-    With three or more groups, val is a *different held-out group*. That is the
-    protocol we want: selecting a checkpoint on an in-distribution val set picks
-    whichever model best overfits the training cohorts, quietly reintroducing
-    the leak this split exists to avoid.
-
-    With exactly two groups that is impossible — holding one out for test leaves
-    nothing to validate on but the training group. We fall back to a random spot
-    subset of train and flag it on the Split, because the alternative (refusing
-    to run) would make leave-one-organ-out unavailable for a two-organ starter
-    set. The fallback weakens model selection, not the test measurement itself,
-    so the headline number stays meaningful — but it should be reported.
-    """
-    column = _GROUP_COLUMN[strategy]
-    groups = sorted(metadata[column].astype(str).unique())
-    if len(groups) < 2:
-        raise ValueError(
-            f"leave-one-{strategy}-out needs >= 2 distinct '{column}' values, got {groups}"
-        )
-
-    values = metadata[column].astype(str).to_numpy()
-    rng = np.random.default_rng(seed)
-    splits = []
-
-    for i, held in enumerate(groups):
-        others = [g for g in groups if g != held]
-        test_idx = np.where(values == held)[0]
-        rest_idx = np.where(values != held)[0]
-
-        if len(groups) >= 3:
-            # Rotate the val group across folds so one unusual cohort doesn't
-            # drive model selection everywhere.
-            val_group = others[i % len(others)]
-            val_idx = np.where(values == val_group)[0]
-            train_idx = np.setdiff1d(rest_idx, val_idx)
-            in_distribution_val = False
-        else:
-            shuffled = rng.permutation(rest_idx)
-            n_val = max(1, int(round(len(shuffled) * val_frac)))
-            val_idx = np.sort(shuffled[:n_val])
-            train_idx = np.sort(shuffled[n_val:])
-            in_distribution_val = True
-
-        splits.append(
-            Split(
-                name=f"{strategy}:{held}",
-                strategy=strategy,
-                train=train_idx,
-                val=val_idx,
-                test=test_idx,
-                held_out=held,
-                in_distribution_val=in_distribution_val,
-            )
-        )
-    return splits
+def cross_organ(metadata, train_organ="Breast", test_organ="Prostate", val_frac=0.1, seed=0):
+    """Val is held out from the training organ — there's no second organ to
+    spare, and validating on prostate would be selecting on the test set."""
+    train_idx = np.random.default_rng(seed).permutation(
+        np.where(metadata.organ == train_organ)[0]
+    )
+    n_val = int(len(train_idx) * val_frac)
+    return Split(
+        name=f"cross_organ:{train_organ}->{test_organ}",
+        val=np.sort(train_idx[:n_val]),
+        train=np.sort(train_idx[n_val:]),
+        test=np.where(metadata.organ == test_organ)[0],
+    )
 
 
-def build_splits(metadata: pd.DataFrame, strategy: str, seed: int = 0, **kwargs) -> list[Split]:
-    """Entry point. Returns a list because leave-one-out yields one fold per group."""
-    if strategy == "random":
-        return random_split(metadata, seed=seed, **kwargs)
-    if strategy in _GROUP_COLUMN:
-        return leave_one_group_out(metadata, strategy, seed=seed, **kwargs)
-    raise ValueError(f"unknown strategy '{strategy}', expected one of {STRATEGIES}")
-
-
-def build_all_splits(metadata: pd.DataFrame, seed: int = 0) -> dict[str, list[Split]]:
-    """All four strategies from the same metadata, so results are comparable."""
-    return {s: build_splits(metadata, s, seed=seed) for s in STRATEGIES}
+def build_split(metadata, strategy, seed=0):
+    if strategy == "within_cohort":
+        return within_cohort(metadata, seed=seed)
+    if strategy == "cross_organ":
+        return cross_organ(metadata, seed=seed)
+    raise ValueError(f"unknown strategy {strategy!r}, expected one of {STRATEGIES}")
