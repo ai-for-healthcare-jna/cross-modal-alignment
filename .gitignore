@@ -1,10 +1,10 @@
-# Data and artefacts — all reproducible from the scripts, none of it belongs in git.
+# Raw data and cached features — large, and reproducible from the scripts.
 data/
 embeddings/
-results/*
-!results/.gitkeep
 *.pt
 *.ckpt
+
+# Result JSONs are small and are what the README quotes, so they are tracked.
 
 # Python
 __pycache__/

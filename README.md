@@ -1,137 +1,118 @@
-# cross-modal-alignment
+# Contrastive image–expression alignment on HEST-Benchmark (IDC)
 
-**Cross-organ generalization of image–expression alignment**
+A small study of contrastive alignment between histology images and spatial gene expression, evaluated on the breast cancer (IDC) task of HEST-Benchmark. I first reproduce the benchmark's published regression baseline, then train a contrastive alignment on the same patient-held-out splits and compare the two.
 
-> **Status: pilot in progress.** The pipeline runs end to end on synthetic data.
-> Real embeddings have not been computed yet and there are no results. This
-> README gets rewritten once there are.
+## Motivation
 
----
+H&E-stained tissue images are taken routinely in pathology and are cheap to produce. Spatial transcriptomics measures which genes are active at each location in the tissue, but it is expensive and rare. If a model can learn the relationship between what tissue looks like and what its genes are doing, molecular information could in principle be inferred from routine images.
 
-## Background
-
-Spatial transcriptomics gives paired data: a histology image (a photo of tissue
-under a microscope) and a gene expression profile (which genes are active at that
-location), both measured from the same physical spot on a tissue slice. Foundation
-models exist for each modality separately. This project asks whether their internal
-representations can be aligned across modalities, and whether that alignment
-survives when tested on tissue the model was never trained on.
-
-## Research question
-
-Train a contrastive alignment between frozen histopathology-image embeddings and
-gene-expression embeddings on breast cancer tissue. Does it transfer to prostate
-cancer tissue, or did it only learn something specific to the cohort it saw?
-
-Both cohorts are Visium, so platform, assay chemistry and spot geometry are held
-fixed. Organ is the only thing that changes.
-
-### Three numbers
-
-| | What it measures |
-|---|---|
-| Chance | 1/N for a gallery of N candidates. Reported alongside every score, because Recall@1 is meaningless without it. |
-| Within-cohort | Breast spots split 80/20. Neighbouring spots from the same slide land on both sides, so this is the optimistic baseline. |
-| Cross-organ | Train breast, test prostate. |
-
-The gap between within-cohort and cross-organ is the result.
-
-## Approach
-
-Both encoders are frozen. The only trainable parameters are two small MLP heads
-projecting into a shared 128-d space, trained with InfoNCE.
-
-- **Image side:** [Phikon-v2](https://huggingface.co/owkin/phikon-v2) (ViT-L/16,
-  DINOv2, 1024-d CLS token). Chosen over UNI and H-optimus because those are gated
-  behind institutional-email verification, which would make these results
-  irreproducible for most readers. Trained on ~450M 20x histology tiles from public
-  cohorts, matching the magnification HEST patches are cut at.
-- **Expression side:** the 50 highest-variance genes, library-size normalised to
-  10,000 counts per spot and log1p transformed. No learned expression encoder — the
-  normalised vector goes straight into its projection head.
-- **Data:** [HEST-1k](https://github.com/mahmoodlab/hest)
-  ([paper](https://arxiv.org/abs/2406.16192)). Two Visium cohorts:
-
-| Cohort | Organ | Spots |
-|---|---|---|
-| High resolution mapping of the tumor microenvironment… (`NCBI776`) | Breast | 4,973 |
-| Human Prostate Cancer, Adenocarcinoma with Invasive Carcinoma (`TENX40`) | Prostate | 4,371 |
-
-### Note on the gene panel
-
-HEST-Benchmark ships a 50-gene panel, but it is selected *per organ* — gene 7 in a
-breast task is not gene 7 in a prostate task, which makes those panels useless for
-a cross-organ question. This project builds its own panel instead: intersect the
-genes present in both cohorts (17,368 of them), then take the 50 most variable,
-**fit on training spots only and refit for each split**. Selecting genes with the
-test organ visible would leak the test distribution into the input space.
-
-## Layout
-
-```
-src/
-  data_loading.py   HEST loading, normalisation, gene panel selection
-  embed_images.py   frozen encoder -> cached embeddings (the only GPU-ish step)
-  model.py          two projection heads + InfoNCE
-  train.py          training loop over cached embeddings
-  evaluate.py       retrieval metrics + silhouette
-  splits.py         within-cohort and cross-organ splits
-tests/
-  smoke_test.py     end-to-end on synthetic data, ~1s
-  encoder_check.py  loads the real encoder, needs a 1.1 GB download
-```
-
-`data/`, `embeddings/` and `results/` are gitignored.
-
-### Why embeddings are cached
-
-The image encoder is frozen, so a patch produces the same vector forever. Running
-the ViT again for each split would be recomputing a constant. `embed_images.py`
-does one pass and writes `embeddings/<encoder>/<sample_id>.npz`; everything
-downstream reads from there, which keeps training and evaluation on CPU at a few
-seconds per run.
-
-Reading HEST needs only `h5py` — `.h5ad` is plain HDF5, so there is no `anndata`,
-`scanpy` or `openslide` dependency, and the pre-extracted patches mean the
-multi-GB whole-slide images are never downloaded.
+Two common ways to connect the modalities are direct regression (predict genes from image features) and contrastive alignment (map both modalities into a shared space where matching pairs sit close together). This project compares them under the same standard protocol.
 
 ## Setup
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+**Data.** The IDC task from [HEST-Benchmark](https://huggingface.co/datasets/MahmoodLab/hest-bench): 4 patients, 35,536 spots, each with a 224×224 H&E patch at 20× and an expression profile. I use the benchmark's official patient-stratified splits (4 folds, leave-one-patient-out) and its provided list of 50 highly variable genes. Expression is log1p-transformed, matching the benchmark code.
 
-HEST-1k is a gated dataset: accept the terms at
-https://huggingface.co/datasets/MahmoodLab/hest (automatic) and run `hf auth login`.
+**Image encoder.** [Phikon-v2](https://huggingface.co/owkin/phikon-v2), kept frozen. 1024-dim CLS embeddings, extracted once and cached. I chose Phikon-v2 because it is openly available; several stronger pathology encoders require institutional access.
 
-## Usage
+**Hardware.** All runs on a laptop (Apple M4 Max, MPS). Embedding all patches took about 13 minutes; alignment training takes seconds to minutes per fold.
 
-```bash
-# Check the pipeline on synthetic data. No downloads.
-python tests/smoke_test.py
+## Methods
 
-# Cache image embeddings (uses MPS on Apple Silicon, CUDA if present).
-python src/embed_images.py --samples NCBI776 TENX40 --data-dir data/hest
+**1. Baseline reproduction.** Following the benchmark's own code: standardise image features, reduce to 256 dimensions with PCA, fit a ridge regression to the 50 genes. Scored by Pearson correlation per gene, averaged over genes per fold, then mean ± std over folds.
 
-# Train and evaluate both splits.
-python src/train.py --samples NCBI776 TENX40
-```
+**2. Contrastive alignment.** Two small MLP heads map image features and expression vectors into a shared 128-dim space, trained with a symmetric InfoNCE loss. A positive pair is the image patch and expression profile from the same spot; every other pairing in the batch acts as a negative. A learned temperature controls how sharply the loss separates the true match from the rest. Both inputs are standardised using statistics from the training fold only. Early stopping uses a random 10% of training-fold spots; the test patient is never seen during training.
 
-`train.py` without `--samples` runs on synthetic data.
+Hyperparameters, shared across folds: embedding dim 128, batch 256, lr 1e-3, weight decay 1e-4, dropout 0.1, patience 15, max 100 epochs, seed 0.
+
+**3. Evaluation on the held-out patient.**
+- *Gene prediction by nearest neighbours.* For each test spot, find its k nearest training spots and average their measured expression. Done in two spaces: raw Phikon-v2 features (no alignment), and the aligned space (test image embedding against training expression embeddings). This separates the effect of alignment from the simpler fact that similar-looking tissue tends to have similar expression. Scored exactly like the baseline. k = 10, 50, 100, all reported.
+- *Cross-modal retrieval.* Recall@1/5/10 and MRR in both directions. Test patients range from 3,005 to 20,761 spots, so retrieval is computed on random 1,000-spot subsets (10 draws) to keep folds comparable.
+
+## Results
+
+**Baseline reproduction.** 0.5408 ± 0.0773, matching the [published Phikon-v2 IDC result](https://github.com/mahmoodlab/HEST) of 0.5408.
+
+**Gene prediction (Pearson, mean over 50 genes).**
+
+| Method | Fold 0 | Fold 1 | Fold 2 | Fold 3 | Mean ± std |
+|---|---|---|---|---|---|
+| Ridge (benchmark protocol) | 0.4504 | 0.5926 | 0.4816 | 0.6385 | **0.5408 ± 0.0773** |
+| kNN, raw features, k=10 | 0.3659 | 0.4691 | 0.4088 | 0.5170 | 0.4402 ± 0.0575 |
+| kNN, raw features, k=50 | 0.3803 | 0.4987 | 0.4435 | 0.5541 | 0.4692 ± 0.0645 |
+| kNN, raw features, k=100 | 0.3761 | 0.4994 | 0.4535 | 0.5635 | 0.4731 ± 0.0683 |
+| kNN, aligned space, k=10 | 0.4189 | 0.5174 | 0.4191 | 0.4888 | 0.4610 ± 0.0432 |
+| kNN, aligned space, k=50 | 0.4366 | 0.5373 | 0.4401 | 0.5156 | 0.4824 ± 0.0447 |
+| kNN, aligned space, k=100 | 0.4412 | 0.5447 | 0.4460 | 0.5238 | 0.4889 ± 0.0459 |
+
+Held-out patients: fold 0 TENX99 (20,761 spots), fold 1 TENX95 (7,760), fold 2 NCBI785 (4,010), fold 3 NCBI783 (3,005).
+
+**Cross-modal retrieval (1,000-spot subsets, mean ± std over folds).**
+
+| Direction | R@1 | R@5 | R@10 | MRR |
+|---|---|---|---|---|
+| Image → expression | 0.0166 ± 0.0074 | 0.0617 ± 0.0277 | 0.1088 ± 0.0497 | 0.0519 ± 0.0203 |
+| Expression → image | 0.0162 ± 0.0092 | 0.0610 ± 0.0322 | 0.1046 ± 0.0551 | 0.0495 ± 0.0232 |
+
+Chance R@1 is 0.001.
+
+## What the results show
+
+**Ridge is the best gene predictor here** (0.541 vs 0.489 for the best alignment-based method). That is not surprising: ridge is fitted directly to predict genes, while the alignment is trained to match pairs, and prediction is a by-product.
+
+**Alignment gives a small, inconsistent improvement over raw-feature lookup.** On average, aligned kNN beats raw kNN at every k (by 0.013 to 0.021) and varies less across patients. Per patient, though, the picture is mixed: at k=100 it helps on folds 0 and 1, is roughly even on fold 2, and is worse on fold 3. With four patients, an average gain this small cannot be claimed with confidence.
+
+**Retrieval carries a real but modest signal.** Recall@1 is about 16× chance on patients the model never saw, and both directions behave similarly. Exact-spot retrieval is inherently hard here: neighbouring spots look and express almost identically, so many "wrong" retrievals are near-duplicates of the right one.
 
 ## Limitations
 
-- No learned expression encoder — 50 genes through one MLP is a thin
-  representation of a transcriptome.
-- One cohort per organ, one sample per cohort. Organ is confounded with everything
-  else that differs between two studies, so a cross-organ drop is not proof of an
-  organ effect specifically.
-- No batch-effect correction. That is the natural follow-up.
-- Two cohorts means the cohort and organ silhouettes are the same partition, and
-  the platform silhouette is undefined.
+- Four patients, so error bars are wide and small differences between methods are not meaningful.
+- A single random seed for alignment training.
+- kNN performance was still rising at k=100, so its ceiling is unknown.
+- Early stopping uses spots from the training patients, which makes stopping slightly optimistic. It never touches the test patient.
+- One task, one encoder.
 
-## Licence
+## What I'd do next
 
-MIT.
+1. **Run the same protocol on other HEST-Benchmark tasks.** Nothing changes in the code, and more patients and tissues would show whether the small alignment gain is real or noise.
+2. **Multiple seeds and a wider range of k.** Cheap, and it would turn the current comparison into one with proper uncertainty.
+3. **Ridge on the aligned image embeddings.** Tests whether the shared space is a better input for regression than raw features, combining the strengths of both approaches.
+
+## A note on evaluation design
+
+An earlier pilot on a single tissue slice used a random split of spots into train and test. Retrieval there looked far stronger, around 155× chance. With patient-held-out splits it drops to about 16×. The setups are not directly comparable (different sample, gene list and normalisation), but the size of the gap is consistent with spatial leakage: in a random split within one slice, most test spots have near-identical neighbours in the training set. The main takeaway for me was that the split design can matter more than the model.
+
+## Reproducing
+
+Python 3.11, run from the repository root.
+
+```bash
+# Environment
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Hugging Face. Neither repo is gated at the time of writing, so this is
+# optional; it avoids anonymous rate limits.
+hf auth login
+
+# Data: the 23 IDC files (patches, adata, splits, gene list), ~5.6 GB.
+hf download MahmoodLab/hest-bench --repo-type dataset --include "IDC/*" --local-dir data/hest-bench
+
+# Cache frozen Phikon-v2 CLS embeddings for all 35,536 patches (~13 min on MPS).
+python src/embed_images.py --samples TENX95 TENX99 NCBI783 NCBI785 --data-dir data/hest-bench/IDC
+
+# Step 1: PCA + ridge baseline -> results/benchmark_idc.json
+python src/benchmark.py
+
+# Steps 2-3: alignment training and evaluation -> results/alignment_idc.json
+python src/alignment.py
+```
+
+`embed_images.py` picks MPS, then CUDA, then CPU unless `--device` says otherwise; the other two scripts run on CPU in a few minutes. `python tests/smoke_test.py` exercises the pipeline on synthetic data in a couple of seconds and needs no download.
+
+## References
+
+- Jaume et al. *HEST-1k: A Dataset for Spatial Transcriptomics and Histology Image Analysis.* NeurIPS 2024. [arXiv:2406.16192](https://arxiv.org/abs/2406.16192)
+- Filiot et al. *Phikon-v2, A large and public feature extractor for biomarker prediction.* 2024. [arXiv:2409.09173](https://arxiv.org/abs/2409.09173)
+- Xie et al. *Spatially Resolved Gene Expression Prediction from H&E Histology Images via Bi-modal Contrastive Learning (BLEEP).* NeurIPS 2023.
+- Gindra et al. *A Large-Scale Benchmark of Cross-Modal Learning for Histology and Gene Expression in Spatial Transcriptomics (HESCAPE).* ICCV Workshops 2025. [arXiv:2508.01490](https://arxiv.org/abs/2508.01490)
+- Radford et al. *Learning Transferable Visual Models From Natural Language Supervision (CLIP).* ICML 2021.
