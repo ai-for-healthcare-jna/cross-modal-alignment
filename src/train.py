@@ -1,13 +1,4 @@
-"""Contrastive training on cached embeddings.
-
-Runs on CPU in seconds once embed_images.py has populated the cache — the only
-tensors involved are a few thousand rows of a couple of thousand floats. That
-cheapness is the whole reason the caching step exists.
-
-One model per split. Everything fit from data — the gene panel, the image
-feature standardisation — comes from that split's training spots only, so the
-cross-organ number means what it claims to.
-"""
+"""Contrastive training on cached embeddings."""
 
 from __future__ import annotations
 
@@ -21,7 +12,7 @@ import torch
 
 from data_loading import SpotData, build_expression_features, make_dummy_dataset
 from embed_images import DEFAULT_ENCODER, load_cached_embeddings
-from evaluate import evaluate_split, retrieval_metrics
+from evaluate import evaluate_split, raw_baseline, retrieval_metrics
 from model import AlignmentModel, info_nce_loss
 from splits import STRATEGIES, Split, build_split
 
@@ -41,14 +32,10 @@ class TrainConfig:
 
 
 def standardize(features: np.ndarray, train_idx: np.ndarray) -> np.ndarray:
-    """Zero-mean unit-variance per dimension, using training statistics only.
+    """Zero-mean unit-variance per dimension, from training stats only.
 
-    Phikon-v2's output dimensions have very different scales and offsets. Feeding
-    them raw makes the first linear layer spend its capacity undoing that.
-    Statistics come from train because computing them over the held-out cohort
-    would let the model see the test distribution's mean — a small leak, but the
-    kind that matters when the claim is specifically about cross-cohort
-    transfer.
+    Train-only because the mean of the held-out organ would otherwise leak into
+    the thing we're measuring.
     """
     mean = features[train_idx].mean(axis=0, keepdims=True)
     std = features[train_idx].std(axis=0, keepdims=True)
@@ -56,12 +43,8 @@ def standardize(features: np.ndarray, train_idx: np.ndarray) -> np.ndarray:
 
 
 def _batches(n: int, batch_size: int, rng: np.random.Generator):
-    """Shuffled batches, dropping a trailing short batch.
-
-    drop_last matters here in a way it doesn't for supervised training: InfoNCE
-    difficulty is set by batch size, so a stray batch of 3 would contribute a
-    near-zero loss and a misleadingly high training accuracy.
-    """
+    # Drop the short tail batch. InfoNCE difficulty scales with batch size, so
+    # a stray batch of 3 contributes ~zero loss and flatters training accuracy.
     idx = rng.permutation(n)
     for start in range(0, n - batch_size + 1, batch_size):
         yield idx[start : start + batch_size]
@@ -69,10 +52,10 @@ def _batches(n: int, batch_size: int, rng: np.random.Generator):
 
 @torch.no_grad()
 def _val_score(model, image_features, expr_features, split: Split, device: str) -> float:
-    """Mean Recall@1 over both directions on the val fold — the early-stopping signal.
+    """Early-stopping signal: mean Recall@1 over both directions on val.
 
-    Retrieval rather than loss, because val loss depends on val set size (more
-    candidates = harder) and isn't comparable across folds of different sizes.
+    Retrieval not loss - val loss scales with val set size, so it isn't
+    comparable across splits.
     """
     from evaluate import embed_split
 
@@ -91,7 +74,6 @@ def train_one_split(
     cfg: TrainConfig,
     verbose: bool = True,
 ) -> tuple[AlignmentModel, list[dict]]:
-    """Train a single alignment model on one fold."""
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     device = cfg.device
@@ -107,7 +89,7 @@ def train_one_split(
     img_train = torch.as_tensor(image_features[split.train], dtype=torch.float32, device=device)
     expr_train = torch.as_tensor(expr_features[split.train], dtype=torch.float32, device=device)
 
-    # A batch larger than the training set would silently produce zero batches.
+    # Otherwise _batches yields nothing at all.
     batch_size = min(cfg.batch_size, len(split.train))
 
     history: list[dict] = []
@@ -143,8 +125,7 @@ def train_one_split(
                     print(f"      early stop at epoch {epoch} (best val R@1 {best_score:.3f})")
                 break
 
-    # Restore the best checkpoint rather than the last one — with small val
-    # folds the score is noisy and the final epoch is often not the best.
+    # Best checkpoint, not the last - val is small and noisy here.
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, history
@@ -160,7 +141,7 @@ def run_strategy(
     """Train and evaluate one split strategy."""
     split = build_split(data.metadata, strategy, seed=cfg.seed)
 
-    # Both are fit from data, so both are refit per split and never see test.
+    # Both are fit from data, so refit per split and never let them see test.
     expr_features, genes = build_expression_features(data, split.train, n_genes=cfg.n_genes)
     image_features = standardize(image_features_raw, split.train)
 
@@ -171,9 +152,12 @@ def run_strategy(
 
     if verbose:
         print(f"    {split.name} {split.sizes()}")
+        # recall@k is dropped when k exceeds the gallery, which happens on the
+        # dummy data.
+        r5 = metrics.get("i2e_recall@5", float("nan"))
         print(f"      i2e R@1 {metrics['i2e_recall@1']:.3f} "
               f"(chance {metrics['i2e_chance_recall@1']:.4f}) "
-              f"R@5 {metrics['i2e_recall@5']:.3f} MRR {metrics['i2e_mrr']:.3f}")
+              f"R@5 {r5:.3f} MRR {metrics['i2e_mrr']:.3f}")
     return {
         "strategy": strategy,
         "split": split.name,
@@ -217,8 +201,14 @@ def main() -> None:
 
     print(data.summary().to_string(index=False))
 
-    results = [run_strategy(data, image_features, strategy, cfg)
-               for strategy in args.strategies]
+    # Baseline uses the full gene panel refit on everything - it isn't a
+    # held-out measurement, just what the frozen features already contain.
+    expr_all, _ = build_expression_features(data, np.arange(len(data)), cfg.n_genes)
+    baseline = {"strategy": "raw_features", "split": "none",
+                **raw_baseline(image_features, expr_all, data.metadata, seed=cfg.seed)}
+
+    results = [baseline] + [run_strategy(data, image_features, strategy, cfg)
+                            for strategy in args.strategies]
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

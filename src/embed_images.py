@@ -1,19 +1,4 @@
-"""Run the frozen image encoder over every patch once and cache the result.
-
-Why this is a separate script rather than part of the training loop:
-
-The image encoder is frozen — it is never updated, so a given patch produces
-the same vector on every epoch of every experiment. Re-running a 300M-parameter
-ViT over the same patches for each of four split strategies would burn GPU time
-to recompute a constant. Instead we pay for one pass, write the vectors to
-disk, and every downstream script reads from that cache. The practical effect
-is that this is the only step needing a GPU: after it finishes, training and
-evaluation run on a laptop CPU in seconds, which is what makes it feasible to
-iterate on the actual research question.
-
-The cache is keyed by (encoder, sample_id) so switching encoders creates a new
-cache directory instead of silently reusing vectors from a different model.
-"""
+"""Cache frozen image embeddings for HEST patches."""
 
 from __future__ import annotations
 
@@ -25,36 +10,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Encoder registry. Adding an entry here is all that is needed to compare
-# against another encoder, which is worth having: "the result held with a second
-# encoder" is a cheap and meaningful robustness check once the cache exists.
-#
-# Phikon-v2 is the default, chosen for three reasons:
-#
-#   Open access. It needs no gating request and no institutional email, so
-#   anyone reading this repo can reproduce the numbers. The stronger
-#   alternatives in this space (UNI, H-optimus) are both gated behind
-#   institutional verification, which makes them unusable here and would make
-#   the results unreproducible for most readers.
-#
-#   Magnification match. Trained on 20x histology tiles, which is the
-#   magnification HEST patches are cut at (224 px at 0.5 um/px). An encoder
-#   trained at a different magnification would see our patches out of
-#   distribution, and any failure to align would be confounded with that.
-#
-#   Known quantity. Phikon-v2 appears in the HEST-Benchmark comparison table,
-#   so its behaviour on this exact dataset family is already documented. That
-#   gives a reference point for whether our frozen features are reasonable
-#   before we start interpreting alignment results.
-#
-# It is a ViT-L/16 (DINOv2 architecture) pretrained on ~450M tiles from public
-# cohorts including TCGA, CPTAC and GTEx. Non-commercial licence, which is fine
-# for research use.
+# Phikon-v2 over UNI/H-optimus because those are gated on institutional email.
+# Keyed registry so swapping encoders writes a separate cache dir rather than
+# silently mixing vectors from two models.
 ENCODERS = {
     "phikon-v2": {"hf_id": "owkin/phikon-v2", "embed_dim": 1024},
-    # ViT-B predecessor. Half the width, so it doubles as a quick check that
-    # results are not an artefact of one particular feature dimensionality.
-    "phikon": {"hf_id": "owkin/phikon", "embed_dim": 768},
+    "phikon": {"hf_id": "owkin/phikon", "embed_dim": 768},  # ViT-B, 768-d
 }
 
 DEFAULT_ENCODER = "phikon-v2"
@@ -78,12 +39,8 @@ def save_embeddings(
     sample_id: str, spot_ids: list[str], features: np.ndarray,
     encoder: str = DEFAULT_ENCODER, root: str | Path = "embeddings",
 ) -> Path:
-    """One .npz per sample, holding features and the spot ids they belong to.
-
-    Storing the ids alongside the array means a later reordering of the
-    metadata can't silently misalign patches with expression vectors — the
-    loader matches by id rather than trusting row order.
-    """
+    # Store ids next to the array so the loader can match on them instead of
+    # trusting row order.
     out_dir = cache_dir_for(encoder, root)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{sample_id}.npz"
@@ -95,11 +52,7 @@ def save_embeddings(
 def load_cached_embeddings(
     spot_ids, encoder: str = DEFAULT_ENCODER, root: str | Path = "embeddings"
 ) -> np.ndarray:
-    """Load features for the given spot ids, in that exact order.
-
-    Raises on a cache miss rather than returning a partial array — a silently
-    dropped cohort would be very hard to notice in a results table.
-    """
+    """Features for the given spot ids, in that order."""
     cache = cache_dir_for(encoder, root)
     files = sorted(cache.glob("*.npz"))
     if not files:
@@ -111,6 +64,8 @@ def load_cached_embeddings(
             for sid, vec in zip(z["spot_ids"], z["features"]):
                 lookup[str(sid)] = vec
 
+    # Raise rather than return a partial array - a quietly dropped cohort is
+    # very hard to spot in a results table.
     missing = [s for s in spot_ids if s not in lookup]
     if missing:
         raise KeyError(
@@ -121,25 +76,19 @@ def load_cached_embeddings(
 
 
 def load_encoder(encoder: str, device: str):
-    """Load the frozen encoder and its matching image processor.
-
-    The processor is loaded from the same checkpoint rather than hand-rolled:
-    it carries the resize and per-channel normalisation the model was trained
-    with, and getting those wrong silently degrades features rather than
-    raising.
-
-    eval() and requires_grad_(False) are both set here rather than left to the
-    caller. The encoder being frozen is an assumption baked into the whole
-    design of this repo, so it is enforced at the point of construction.
-    """
+    """Frozen encoder plus its matching image processor."""
     from transformers import AutoImageProcessor, AutoModel
 
     if encoder not in ENCODERS:
         raise ValueError(f"unknown encoder '{encoder}', expected one of {list(ENCODERS)}")
     hf_id = ENCODERS[encoder]["hf_id"]
 
+    # Processor from the same checkpoint - it carries the resize and channel
+    # normalisation the model was trained with, and getting those wrong
+    # degrades features silently.
     processor = AutoImageProcessor.from_pretrained(hf_id)
     model = AutoModel.from_pretrained(hf_id)
+    # Freeze here, not at the call site. Everything downstream assumes it.
     model.eval().requires_grad_(False).to(device)
 
     expected = ENCODERS[encoder]["embed_dim"]
@@ -152,14 +101,9 @@ def load_encoder(encoder: str, device: str):
 
 
 def _decode_barcode(raw) -> str:
-    """h5py gives back bytes, not str.
-
-    Worth a named helper because the naive `str(raw)` yields "b'AAACCT'" — the
-    repr, complete with the b and the quotes. That still looks like a plausible
-    id, so it survives every shape check and only fails much later when these
-    keys are matched against the plain-string barcodes in HEST's AnnData. The
-    symptom would be a total cache miss on the real run, after the GPU bill.
-    """
+    # h5py returns bytes and str() on those gives the repr - "b\'AAACCT\'", not
+    # "AAACCT". Looks like a valid id, passes every shape check, then misses the
+    # cache completely when matched against the .h5ad barcodes.
     if isinstance(raw, bytes):
         return raw.decode("utf-8")
     if isinstance(raw, np.bytes_):
@@ -171,31 +115,21 @@ def _decode_barcode(raw) -> str:
 def embed_patch_file(
     patch_file: Path, model, processor, device: str, batch_size: int = 64
 ) -> tuple[list[str], np.ndarray]:
-    """Embed every patch in one HEST patch .h5.
-
-    HEST writes patches as an 'img' dataset of uint8 (N, 224, 224, 3) with a
-    matching 'barcode' dataset. We read in chunks rather than loading the whole
-    file: a large Visium sample is several GB uncompressed.
-
-    We take the CLS token rather than mean-pooling the patch tokens. For a
-    DINOv2-style model the CLS token is the representation the pretraining
-    objective actually shaped, and it is what Phikon-v2's own model card uses —
-    so it is the comparable choice. Mean pooling is a defensible alternative and
-    sometimes helps on dense tasks, but mixing conventions would make our
-    numbers incomparable to published ones for no benefit.
-    """
+    """Embed every patch in one HEST patch .h5."""
     import h5py
     from PIL import Image
 
     features, barcodes = [], []
-    # fp16 on CUDA only. MPS autocast is unreliable and CPU fp16 is slower than
-    # fp32, so neither is worth the risk on a step we run once.
+    # fp16 on CUDA only - MPS autocast is unreliable and CPU fp16 is slower
+    # than fp32.
     amp = (
         torch.autocast(device_type="cuda", dtype=torch.float16)
         if device == "cuda"
         else contextlib.nullcontext()
     )
 
+    # Chunked read: 'img' is uint8 (N, 224, 224, 3) and a big Visium sample is
+    # several GB uncompressed.
     with h5py.File(patch_file, "r") as f:
         images, codes = f["img"], f["barcode"]
         for start in range(0, len(images), batch_size):
@@ -207,6 +141,8 @@ def embed_patch_file(
             with amp:
                 outputs = model(**inputs)
 
+            # CLS token, matching Phikon-v2's model card. Mean pooling is
+            # defensible but would break comparability with published numbers.
             cls = outputs.last_hidden_state[:, 0, :]
             features.append(cls.float().cpu().numpy())
             barcodes.extend(
@@ -246,8 +182,7 @@ def main() -> None:
         barcodes, features = embed_patch_file(
             patch_file, model, processor, device, batch_size=args.batch_size
         )
-        # Prefix with the sample id so spot ids are globally unique once cohorts
-        # are pooled — barcodes are only unique within a sample.
+        # Prefix with sample id - barcodes are only unique within a sample.
         spot_ids = [f"{sample_id}:{b}" for b in barcodes]
         save_embeddings(sample_id, spot_ids, features, encoder=args.encoder, root=args.out)
         print(f"  {sample_id}: {features.shape[0]} spots -> {features.shape[1]}-d")

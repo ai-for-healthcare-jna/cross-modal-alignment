@@ -1,11 +1,4 @@
-"""Load the two HEST Visium cohorts and prepare the expression side of each pair.
-
-A spot is one location on a tissue slice. HEST gives us a 224x224 image patch
-and a gene count vector for that same location — the positive pair we train on.
-
-Pilot scope: two Visium cohorts, breast and prostate. Platform is held fixed so
-organ is the only thing that changes between train and test.
-"""
+"""Load HEST cohorts and build the expression vectors."""
 
 from __future__ import annotations
 
@@ -31,8 +24,8 @@ HEST_COLUMNS = {
     "species": "species",
 }
 
-# HEST includes a few targeted panels (one is 1,056 genes). They can't share a
-# gene panel with whole-transcriptome cohorts, so filter them out at selection.
+# HEST has a few targeted panels (one is 1,056 genes) that can't share a gene
+# panel with whole-transcriptome cohorts.
 MIN_GENES_MEASURED = 5000
 
 
@@ -87,11 +80,9 @@ def select_starter_cohorts(meta, max_spots=6000):
 
 
 def read_counts(path):
-    """Raw counts, gene names and barcodes from a HEST .h5ad.
-
-    Read with h5py rather than anndata — .h5ad is plain HDF5 and we only need
-    three arrays, so it isn't worth another dependency.
-    """
+    """Raw counts, gene names and barcodes from a HEST .h5ad."""
+    # h5py not anndata: .h5ad is plain HDF5 and we need three arrays, which
+    # isn't worth the dependency.
     with h5py.File(path, "r") as f:
         X = f["X"]
         shape = tuple(X.attrs["shape"])
@@ -146,11 +137,8 @@ def load_cohorts(sample_ids, data_dir="data/hest", meta=None):
 def normalize_counts(counts):
     """Scale each spot to 10,000 counts, then log1p.
 
-    Sequencing depth varies several-fold between spots for reasons unrelated to
-    biology — capture efficiency, how many cells sit under the spot. Without
-    rescaling, InfoNCE's cosine similarity would partly be measuring depth,
-    which is the technical signal we're trying to show the model ignores.
-    log1p then compresses the long tail and leaves the many zeros at zero.
+    Without the rescale, cosine similarity would partly be measuring
+    sequencing depth rather than biology.
     """
     totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
     return np.log1p(counts / totals * 1e4).astype(np.float32)
@@ -159,11 +147,9 @@ def normalize_counts(counts):
 def select_hvg(normalized, train_idx, n_genes=50):
     """Most variable genes, measured on training spots only.
 
-    HEST-Benchmark's own 50-gene panels are picked per organ, so gene 7 in a
-    breast task isn't gene 7 in a prostate one — useless for a cross-organ
-    question. We build our own panel instead, and fit it on train only because
-    choosing genes with the test cohort visible would leak the thing we're
-    trying to measure.
+    Our own panel rather than HEST-Benchmark's: theirs is picked per organ, so
+    gene 7 in a breast task isn't gene 7 in a prostate one. Train-only because
+    picking genes with the test organ visible leaks what we're measuring.
     """
     variances = normalized[train_idx].var(axis=0)
     return np.sort(np.argsort(variances)[-n_genes:])
@@ -177,16 +163,14 @@ def build_expression_features(data, train_idx, n_genes=50):
 
 
 def make_dummy_dataset(n_per_cohort=20, n_genes=200, seed=0):
-    """Fake SpotData shaped like the pilot, for the smoke test.
-
-    Counts get a per-cohort rate offset so there's a synthetic batch effect and
-    the technical silhouette has something to respond to.
-    """
+    """Fake SpotData shaped like the pilot, for the smoke test."""
     rng = np.random.default_rng(seed)
     cohorts = [("cohort_breast", "Breast"), ("cohort_prostate", "Prostate")]
 
     rows, blocks = [], []
     for i, (cohort, organ) in enumerate(cohorts):
+        # Per-cohort rate offset: a synthetic batch effect for the silhouette
+        # to respond to.
         blocks.append(rng.poisson(2.0 + i, size=(n_per_cohort, n_genes)))
         rows += [{
             "spot_id": f"{cohort}:spot{s}",

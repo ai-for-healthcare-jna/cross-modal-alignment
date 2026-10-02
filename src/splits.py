@@ -1,14 +1,4 @@
-"""Train/val/test indices for the two evaluations.
-
-within_cohort  breast spots split 80/20. Neighbouring spots from the same
-               slide land on both sides, so the model can do well by
-               memorising the slide. Optimistic baseline, not a result.
-cross_organ    train on breast, test on prostate. Same platform, same assay,
-               different tissue.
-
-The gap between them is the finding. Chance level is reported alongside both
-in evaluate.py, since Recall@1 only means something relative to gallery size.
-"""
+"""Train/val/test indices for the within-cohort and cross-organ splits."""
 
 from __future__ import annotations
 
@@ -31,6 +21,8 @@ class Split:
 
 
 def within_cohort(metadata, organ="Breast", val_frac=0.1, test_frac=0.2, seed=0):
+    # No grouping by slide, so adjacent spots land on both sides. That's the
+    # point - this is the optimistic number.
     idx = np.where(metadata.organ == organ)[0]
     idx = np.random.default_rng(seed).permutation(idx)
 
@@ -45,8 +37,8 @@ def within_cohort(metadata, organ="Breast", val_frac=0.1, test_frac=0.2, seed=0)
 
 
 def cross_organ(metadata, train_organ="Breast", test_organ="Prostate", val_frac=0.1, seed=0):
-    """Val is held out from the training organ — there's no second organ to
-    spare, and validating on prostate would be selecting on the test set."""
+    # Val comes out of the training organ: there's no third organ to spare and
+    # validating on prostate would be selecting on the test set.
     train_idx = np.random.default_rng(seed).permutation(
         np.where(metadata.organ == train_organ)[0]
     )
