@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 from sklearn.metrics import silhouette_score
 
 RECALL_KS = (1, 5, 10)
@@ -19,10 +18,6 @@ def _cosine_sim(a, b):
     assert np.isfinite(a).all() and np.isfinite(b).all(), "non-finite embeddings"
     with np.errstate(all="ignore"):
         return a @ b.T
-
-
-def _unit(x):
-    return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
 
 
 def retrieval_metrics(query_emb, gallery_emb, ks=RECALL_KS):
@@ -70,48 +65,6 @@ def structure_metrics(embeddings, metadata):
         "silhouette_cohort": safe_silhouette(embeddings, metadata["cohort_id"].to_numpy()),
         "silhouette_platform": safe_silhouette(embeddings, metadata["platform"].to_numpy()),
     }
-
-
-def raw_baseline(image_features, expr_features, metadata, n_sample=2000, seed=0):
-    """What's already there before training anything.
-
-    Cross-modal Recall@k on raw features isn't defined - image features are
-    1024-d and expression vectors 50-d, so there is no shared space to rank in
-    without fitting a map, and fitting one is the thing we're trying to
-    baseline. What needs no fitting is neighbourhood agreement: if morphology
-    and expression covary at all, spots that look alike should also have
-    similar expression.
-    """
-    rng = np.random.default_rng(seed)
-    n = len(image_features)
-    idx = rng.choice(n, min(n_sample, n), replace=False)  # pairwise, so cap it
-
-    img = _unit(image_features[idx])
-    expr = _unit(expr_features[idx])
-    s_img = _cosine_sim(img, img)
-    s_expr = _cosine_sim(expr, expr)
-
-    off = ~np.eye(len(idx), dtype=bool)
-    rho = spearmanr(s_img[off], s_expr[off]).statistic
-
-    # Rank of each spot's nearest expression neighbour within its image-space
-    # ranking. Self-similarity excluded or it would trivially rank first.
-    np.fill_diagonal(s_img, -np.inf)
-    np.fill_diagonal(s_expr, -np.inf)
-    top_expr = s_expr.argmax(axis=1)
-    img_rank = (s_img > s_img[np.arange(len(idx)), top_expr][:, None]).sum(axis=1) + 1
-
-    out = {
-        "raw_structure_spearman": float(rho),
-        "raw_n_sample": float(len(idx)),
-        "silhouette_organ": safe_silhouette(_unit(image_features), metadata["organ"].to_numpy()),
-        "silhouette_cohort": safe_silhouette(_unit(image_features), metadata["cohort_id"].to_numpy()),
-        "silhouette_platform": float("nan"),
-    }
-    for k in RECALL_KS:
-        out[f"raw_neighbour_recall@{k}"] = float((img_rank <= k).mean())
-        out[f"raw_neighbour_chance@{k}"] = float(k / (len(idx) - 1))
-    return out
 
 
 @torch.no_grad()
