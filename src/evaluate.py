@@ -1,11 +1,9 @@
-"""Retrieval and clustering metrics."""
+"""Retrieval metrics."""
 
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import torch
-from sklearn.metrics import silhouette_score
 
 RECALL_KS = (1, 5, 10)
 
@@ -48,25 +46,6 @@ def cross_modal_retrieval(image_emb, expr_emb):
     return out
 
 
-def safe_silhouette(embeddings, labels):
-    labels = np.asarray(labels)
-    n_labels = len(np.unique(labels))
-    # The pilot has one platform, so that silhouette is undefined. Return NaN
-    # rather than raising - it should read as "not measurable" in the table.
-    if n_labels < 2 or n_labels >= len(labels):
-        return float("nan")
-    with np.errstate(all="ignore"):
-        return float(silhouette_score(embeddings, labels, metric="cosine"))
-
-
-def structure_metrics(embeddings, metadata):
-    return {
-        "silhouette_organ": safe_silhouette(embeddings, metadata["organ"].to_numpy()),
-        "silhouette_cohort": safe_silhouette(embeddings, metadata["cohort_id"].to_numpy()),
-        "silhouette_platform": safe_silhouette(embeddings, metadata["platform"].to_numpy()),
-    }
-
-
 @torch.no_grad()
 def embed_split(model, image_features, expr_features, device="cpu"):
     model.eval().to(device)
@@ -74,17 +53,3 @@ def embed_split(model, image_features, expr_features, device="cpu"):
     expr = torch.as_tensor(expr_features, dtype=torch.float32, device=device)
     image_emb, expr_emb = model(img, expr)
     return image_emb.cpu().numpy(), expr_emb.cpu().numpy()
-
-
-def evaluate_split(model, image_features, expr_features, metadata, test_idx, device="cpu"):
-    image_emb, expr_emb = embed_split(model, image_features, expr_features, device=device)
-
-    metrics = cross_modal_retrieval(image_emb[test_idx], expr_emb[test_idx])
-
-    # Silhouette over all spots, not just test: under cross_organ the test set
-    # is a single organ, so an organ silhouette there has one label and is
-    # undefined. It's a question about the whole space anyway.
-    shared = np.vstack([image_emb, expr_emb])
-    doubled = pd.concat([metadata, metadata], ignore_index=True)
-    metrics.update(structure_metrics(shared, doubled))
-    return metrics
