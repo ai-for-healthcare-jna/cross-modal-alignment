@@ -61,12 +61,3 @@ def read_expression(expr_path, genes, barcodes):
     row_pos = {b: i for i, b in enumerate(all_barcodes)}
     sub = counts[np.ix_([row_pos[b] for b in barcodes], [gene_pos[g] for g in genes])]
     return np.log1p(sub.astype(np.float64))
-
-
-def normalize_counts(counts):
-    """Scale each spot to 10,000 counts, then log1p.
-
-    Kept for the alignment step; the benchmark baseline uses log1p alone.
-    """
-    totals = np.maximum(counts.sum(axis=1, keepdims=True), 1.0)
-    return np.log1p(counts / totals * 1e4).astype(np.float32)
